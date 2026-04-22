@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom'
 import { Client } from '@stomp/stompjs'
 import SockJS from 'sockjs-client'
@@ -10,7 +10,7 @@ import AuthPage from './pages/AuthPage'
 import { getToken, getUser, clearAuth } from './api/auth'
 
 const MAX_POINTS = 60
-const ALERT_THRESHOLD = 105
+const DEFAULT_THRESHOLD = 105
 
 // ─── Auth guard ──────────────────────────────────────────────────────────────
 
@@ -20,28 +20,50 @@ function RequireAuth({ children }) {
 
 // ─── WebSocket hook ──────────────────────────────────────────────────────────
 
-function usePriceFeed() {
-  const [prices, setPrices] = useState([])
-  const [alerts, setAlerts] = useState([])
+function usePriceFeed(threshold) {
+  const thresholdRef = useRef(threshold)
+  useEffect(() => { thresholdRef.current = threshold }, [threshold])
+
+  const [prices, setPrices] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem('btc_prices')
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+  const [alerts, setAlerts] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem('btc_alerts')
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
   const [connected, setConnected] = useState(false)
   const [flashKey, setFlashKey] = useState(0)
 
   useEffect(() => {
+    sessionStorage.setItem('btc_prices', JSON.stringify(prices))
+  }, [prices])
+
+  useEffect(() => {
+    sessionStorage.setItem('btc_alerts', JSON.stringify(alerts))
+  }, [alerts])
+
+  useEffect(() => {
     const client = new Client({
-      webSocketFactory: () => new SockJS('http://localhost:8081/ws'),
+      webSocketFactory: () => new SockJS(`${import.meta.env.VITE_API_URL ?? ''}/ws`),
       reconnectDelay: 3000,
       onConnect: () => {
         setConnected(true)
         client.subscribe('/topic/prices', (msg) => {
           const data = JSON.parse(msg.body)
+          const isAlert = data.price > thresholdRef.current
           const point = {
             price: data.price,
-            alert: data.alert,
+            alert: isAlert,
             time: new Date(data.timestamp).toLocaleTimeString('en', { hour12: false }),
           }
           setPrices((prev) => [...prev.slice(-(MAX_POINTS - 1)), point])
           setFlashKey((k) => k + 1)
-          if (data.alert) setAlerts((prev) => [point, ...prev.slice(0, 99)])
+          if (isAlert) setAlerts((prev) => [point, ...prev.slice(0, 99)])
         })
       },
       onDisconnect: () => setConnected(false),
@@ -56,7 +78,14 @@ function usePriceFeed() {
   const min = prices.length ? Math.min(...prices.map((p) => p.price)) : null
   const max = prices.length ? Math.max(...prices.map((p) => p.price)) : null
 
-  return { prices, alerts, connected, latest, trend, min, max, flashKey }
+  function clearHistory() {
+    setPrices([])
+    setAlerts([])
+    sessionStorage.removeItem('btc_prices')
+    sessionStorage.removeItem('btc_alerts')
+  }
+
+  return { prices, alerts, connected, latest, trend, min, max, flashKey, clearHistory }
 }
 
 // ─── Shared UI components ────────────────────────────────────────────────────
@@ -222,7 +251,7 @@ function PriceHero({ latest, trend, flashKey }) {
   )
 }
 
-function PriceChart({ prices }) {
+function PriceChart({ prices, threshold }) {
   if (prices.length === 0) {
     return (
       <div style={{ height: '280px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px' }}>
@@ -246,8 +275,8 @@ function PriceChart({ prices }) {
         <XAxis dataKey="time" tick={{ fontSize: 10, fill: '#3d4554' }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
         <YAxis domain={[yMin, yMax]} tick={{ fontSize: 10, fill: '#3d4554' }} tickLine={false} axisLine={false} width={44} tickFormatter={(v) => `$${v}`} />
         <Tooltip content={<ChartTooltip />} />
-        <ReferenceLine y={ALERT_THRESHOLD} stroke="#ef444460" strokeDasharray="6 3"
-          label={{ value: `$${ALERT_THRESHOLD}`, position: 'right', fill: '#ef4444', fontSize: 10 }} />
+        <ReferenceLine y={threshold} stroke="#ef444460" strokeDasharray="6 3"
+          label={{ value: `$${threshold}`, position: 'right', fill: '#ef4444', fontSize: 10 }} />
         <Area type="monotone" dataKey="price" stroke="#f59e0b" strokeWidth={2}
           fill="url(#priceGrad)" dot={false}
           activeDot={{ r: 5, fill: '#f59e0b', stroke: '#0a0c10', strokeWidth: 2 }} />
@@ -293,12 +322,78 @@ function AlertLog({ alerts }) {
   )
 }
 
+// ─── Threshold input ─────────────────────────────────────────────────────────
+
+function ThresholdInput({ value, onChange, onClear }) {
+  const [draft, setDraft] = useState(String(value))
+  const [focused, setFocused] = useState(false)
+
+  useEffect(() => {
+    if (!focused) setDraft(String(value))
+  }, [value, focused])
+
+  function commit() {
+    const n = parseFloat(draft)
+    if (!isNaN(n) && n > 0) onChange(n)
+    else setDraft(String(value))
+    setFocused(false)
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+      <span style={{ fontSize: '12px', color: '#64748b', fontWeight: '500' }}>Alert threshold</span>
+      <div style={{
+        display: 'flex', alignItems: 'center',
+        background: '#0a0c10', border: `1px solid ${focused ? '#f59e0b60' : '#22262f'}`,
+        borderRadius: '7px', overflow: 'hidden',
+        boxShadow: focused ? '0 0 0 3px rgba(245,158,11,0.08)' : 'none',
+        transition: 'all 0.15s',
+      }}>
+        <span style={{ padding: '0 8px', fontSize: '13px', color: '#64748b' }}>$</span>
+        <input
+          type="number"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onFocus={() => setFocused(true)}
+          onBlur={commit}
+          onKeyDown={(e) => e.key === 'Enter' && commit()}
+          style={{
+            width: '64px', padding: '6px 6px 6px 0',
+            background: 'transparent', border: 'none', outline: 'none',
+            fontSize: '13px', fontWeight: '600', color: '#f59e0b',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        />
+      </div>
+      <button onClick={onClear} style={{
+        padding: '5px 10px', borderRadius: '6px',
+        border: '1px solid #22262f', background: 'transparent',
+        color: '#64748b', fontSize: '11px', cursor: 'pointer',
+        fontWeight: '500', transition: 'all 0.15s',
+      }}
+        onMouseEnter={e => { e.target.style.color = '#e2e8f0'; e.target.style.borderColor = '#3d4554' }}
+        onMouseLeave={e => { e.target.style.color = '#64748b'; e.target.style.borderColor = '#22262f' }}
+      >
+        Clear history
+      </button>
+    </div>
+  )
+}
+
 // ─── Dashboard page ───────────────────────────────────────────────────────────
 
 function Dashboard() {
   const navigate = useNavigate()
   const username = getUser()
-  const { prices, alerts, connected, latest, trend, min, max, flashKey } = usePriceFeed()
+  const [threshold, setThreshold] = useState(() =>
+    Number(localStorage.getItem('btc_threshold')) || DEFAULT_THRESHOLD
+  )
+
+  useEffect(() => {
+    localStorage.setItem('btc_threshold', threshold)
+  }, [threshold])
+
+  const { prices, alerts, connected, latest, trend, min, max, flashKey, clearHistory } = usePriceFeed(threshold)
 
   function handleLogout() {
     clearAuth()
@@ -362,11 +457,23 @@ function Dashboard() {
         <PriceHero latest={latest} trend={trend} flashKey={flashKey} />
       </div>
 
+      {/* Config bar */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '10px 16px', marginBottom: '16px',
+        background: '#111318', border: '1px solid #22262f', borderRadius: '10px',
+      }}>
+        <ThresholdInput value={threshold} onChange={setThreshold} onClear={clearHistory} />
+        <span style={{ fontSize: '11px', color: '#3d4554' }}>
+          {prices.length} ticks in session
+        </span>
+      </div>
+
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '14px', marginBottom: '20px' }}>
         <StatCard label="Session Low" value={min !== null ? `$${min.toFixed(2)}` : '—'} accent="#3b82f6" icon="↓" />
         <StatCard label="Session High" value={max !== null ? `$${max.toFixed(2)}` : '—'} accent="#8b5cf6" icon="↑" />
-        <StatCard label="Spike Alerts" value={alerts.length} sub={`Threshold: $${ALERT_THRESHOLD}`} accent="#ef4444" icon="⚠" />
+        <StatCard label="Spike Alerts" value={alerts.length} sub={`Threshold: $${threshold}`} accent="#ef4444" icon="⚠" />
       </div>
 
       {/* Chart + Alert log */}
@@ -379,7 +486,7 @@ function Dashboard() {
             <span style={{ fontSize: '13px', fontWeight: '600', color: '#e2e8f0' }}>Price History</span>
             <span style={{ fontSize: '11px', color: '#3d4554' }}>Last {MAX_POINTS} ticks · 1s interval</span>
           </div>
-          <PriceChart prices={prices} />
+          <PriceChart prices={prices} threshold={threshold} />
         </div>
 
         <div style={{

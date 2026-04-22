@@ -9,3 +9,5 @@ frontend/dist/
 .env
 *.log
 .DS_Store
+frontend/.env.development
+frontend/.env.production

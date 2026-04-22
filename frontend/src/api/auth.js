@@ -1,4 +1,4 @@
-const BASE = 'http://localhost:8081/api/auth'
+const BASE = `${import.meta.env.VITE_API_URL ?? ''}/api/auth`
 
 async function post(path, body) {
   const res = await fetch(`${BASE}${path}`, {
